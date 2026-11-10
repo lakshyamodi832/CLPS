@@ -65,7 +65,7 @@ def horizon_at(az_deg, mask):
     return np.interp(az_deg, xp, fp)
 
 
-def timeseries(lat, lon, height_km, start_utc, hours, step_min, mask=None):
+def _timeseries_uncached(lat, lon, height_km, start_utc, hours, step_min, mask=None):
     load_kernels()
     et0 = spice.str2et(start_utc)
     et = et0 + np.arange(0, hours * 3600 + 1, step_min * 60.0)
@@ -80,6 +80,25 @@ def timeseries(lat, lon, height_km, start_utc, hours, step_min, mask=None):
     }
 
 
+import threading
+_LOCK = threading.RLock()   # CSPICE is not thread-safe: serialise all SPICE calls
+_CACHE = {}
+_CACHE_MAX = 128
+
+
+def timeseries(lat, lon, height_km, start_utc, hours, step_min, mask=None):
+    key = (round(lat, 5), round(lon, 5), height_km, start_utc, hours, step_min,
+           None if mask is None else hash(tuple(mask)))
+    with _LOCK:
+        if key in _CACHE:
+            return _CACHE[key]
+        ts = _timeseries_uncached(lat, lon, height_km, start_utc, hours, step_min, mask)
+        if len(_CACHE) >= _CACHE_MAX:
+            _CACHE.pop(next(iter(_CACHE)))
+        _CACHE[key] = ts
+        return ts
+
+
 def _intervals(et, flag):
     """Return list of (start_et, end_et, state) with linear-step edge times."""
     out, start = [], 0
@@ -91,29 +110,85 @@ def _intervals(et, flag):
     return out
 
 
-def windows(ts, now_utc=None):
-    """Contiguous up/down intervals and time until next change for each body."""
+def _refine(body, radius, et, flag, site):
+    """Edge times (ET) where visibility flips, refined by bisection when a site is given."""
+    edges = []
+    for i in range(1, len(flag)):
+        if flag[i] == flag[i - 1]:
+            continue
+        if site is None:
+            edges.append(float(et[i]))
+            continue
+        lat, lon, h, mask = site
+        lo, hi = float(et[i - 1]), float(et[i])
+        for _ in range(14):                      # 600 s / 2^14 -> ~0.04 s
+            mid = 0.5 * (lo + hi)
+            az, el, rad = azel(body, np.array([mid]), lat, lon, h, radius)
+            vis = bool((el[0] + rad[0]) > horizon_at(az, mask)[0])
+            if vis == bool(flag[i - 1]):
+                lo = mid
+            else:
+                hi = mid
+        edges.append(0.5 * (lo + hi))
+    return edges
+
+
+def windows(ts, now_utc=None, site=None):
+    """Up/down intervals and time until next change. site=(lat, lon, h_km, mask)
+    enables second-level edge refinement."""
     res = {}
-    now = spice.str2et(now_utc) if now_utc else ts["et"][0]
-    for name, key in (("sun", "sun_up"), ("earth", "earth_up")):
-        iv = _intervals(ts["et"], ts[key])
-        res[name] = [
-            {"start": spice.et2utc(a, "ISOC", 0), "end": spice.et2utc(b, "ISOC", 0),
-             "visible": s, "hours": (b - a) / 3600} for a, b, s in iv
-        ]
-        cur = next((x for x in iv if x[0] <= now <= x[1]), iv[-1])
-        res[name + "_now"] = {
-            "visible": cur[2],
-            "hours_until_change": (cur[1] - now) / 3600,
-            "open_ended": bool(cur[1] >= ts["et"][-1]),  # extend range if True
-        }
+    et = ts["et"]
+    with _LOCK:
+        now = spice.str2et(now_utc) if now_utc else float(et[0])
+        for name, key, body, radius in (("sun", "sun_up", "SUN", R_SUN),
+                                        ("earth", "earth_up", "EARTH", R_EARTH)):
+            flag = ts[key]
+            bounds = [float(et[0])] + _refine(body, radius, et, flag, site) + [float(et[-1])]
+            state = bool(flag[0])
+            ivs = []
+            for a, b in zip(bounds[:-1], bounds[1:]):
+                ivs.append((a, b, state))
+                state = not state
+            res[name] = [
+                {"start": spice.et2utc(a, "ISOC", 0), "end": spice.et2utc(b, "ISOC", 0),
+                 "visible": v, "hours": (b - a) / 3600} for a, b, v in ivs
+            ]
+            cur = next((x for x in ivs if x[0] <= now <= x[1]), ivs[-1])
+            res[name + "_now"] = {
+                "visible": cur[2],
+                "hours_until_change": float((cur[1] - now) / 3600),
+                "open_ended": bool(cur[1] >= et[-1]),
+            }
     return res
+
+
+def _longest_run(flag, value, step_h):
+    """Longest continuous stretch (hours) where flag == value, within the range."""
+    best = cur = 0
+    for f in flag:
+        if bool(f) == value:
+            cur += 1
+            best = max(best, cur)
+        else:
+            cur = 0
+    return min(best * step_h, max(len(flag) - 1, 0) * step_h)   # cannot exceed the range
 
 
 def summary(ts):
     up_s, up_e = ts["sun_up"], ts["earth_up"]
-    el = np.where(up_s, ts["sun_el"], 0.0)
+    el = np.where(up_s, np.clip(ts["sun_el"], 0.0, None), 0.0)
+    # vertical panel, best fixed azimuth (10 degree steps)
+    A = np.radians(np.arange(0, 360, 10))[:, None]
+    saz = np.radians(ts["sun_az"])[None, :]
+    cel = np.cos(np.radians(ts["sun_el"]))[None, :]
+    f = np.where(up_s[None, :], np.clip(cel * np.cos(saz - A), 0.0, None), 0.0)
+    vm = f.mean(axis=1); vi = int(vm.argmax())
+    step_h = float(ts["et"][1] - ts["et"][0]) / 3600 if len(ts["et"]) > 1 else 0.0
     return {
+        "longest_darkness_hours": float(_longest_run(up_s, False, step_h)),
+        "longest_earth_gap_hours": float(_longest_run(up_e, False, step_h)),
+        "mean_vertical_power_factor": float(vm[vi]),
+        "best_vertical_panel_azimuth_deg": int(vi * 10),
         "pct_sunlit": float(up_s.mean() * 100),
         "pct_earth_visible": float(up_e.mean() * 100),
         "max_sun_el_deg": float(ts["sun_el"].max()),

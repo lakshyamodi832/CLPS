@@ -1,0 +1,6 @@
+fastapi==0.162.2
+numpy==2.4.6
+pydantic==2.14.3
+rasterio==1.4.4
+spiceypy==8.3.0
+uvicorn==0.54.0
